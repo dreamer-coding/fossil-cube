@@ -1,35 +1,36 @@
 # **Fossil CUBE by Fossil Logic**
 
-**Fossil CUBE** is a lightweight, portable graphical user interface (GUI) library written in pure C with zero external dependencies. Designed to provide a clean, minimal abstraction layer for creating cross-platform desktop and embedded graphical applications, Fossil CUBE focuses on core GUI functionality—windows, controls, input handling, and event management—without directly depending on OpenGL or other graphics APIs.
-
-Its modular design, small footprint, and audit-friendly codebase make it ideal for developers who need a reliable, easily integrated GUI foundation on Windows, macOS, Linux, and embedded platforms.
+**Fossil CUBE** is a lightweight, portable graphical user interface (GUI) library written in pure C. Designed for maximum portability and minimal dependencies, Fossil CUBE relies solely on OpenGL for rendering and abstracts away OS-level graphics details. This makes it ideal for cross-platform applications requiring efficient, hardware-accelerated 2D and 3D graphics without bulky frameworks or heavy dependencies.
 
 ### Key Features
 
-- **Cross-Platform GUI Framework**  
-  Provides unified windowing, input, and widget abstractions on Windows, macOS, and Linux.
+- **Minimal Dependencies**  
+  Uses only OpenGL for all rendering tasks—no external GUI toolkits or libraries required.
 
-- **Zero External Dependencies**  
-  Written entirely in portable C for maximum auditability and ease of integration.
+- **Cross-Platform Support**  
+  Compatible with Windows, macOS, Linux, and embedded platforms with OpenGL support.
 
-- **Lightweight and Efficient**  
-  Minimal memory usage and fast execution suitable for embedded and resource-constrained environments.
+- **Pure C Implementation**  
+  Written entirely in clean, portable C for easy integration, auditability, and customization.
 
-- **Modular Design**  
-  Easily extended with custom controls and platform-specific backends.
+- **Hardware-Accelerated Graphics**  
+  Leverages OpenGL to deliver smooth, efficient rendering on modern GPUs.
 
-- **Input & Event Handling**  
-  Supports keyboard, mouse, and touch inputs with flexible event dispatch.
+- **Modular and Extensible**  
+  Flexible design allows you to extend and customize widgets, rendering pipelines, and input handling.
 
-- **Flexible Rendering Backend**  
-  Allows integration with OpenGL, Vulkan, software rendering, or other graphics engines externally.
+- **Simple API**  
+  Designed with ease of use in mind for rapid GUI development.
 
 ## Getting Started
 
 ### Prerequisites
 
+- **OpenGL Development Environment**  
+  You need an OpenGL-compatible environment and drivers installed on your system.
+
 - **Meson Build System**  
-  Fossil CUBE uses Meson for build configuration. If you don’t have Meson installed, please follow the installation instructions on the official [Meson website](https://mesonbuild.com/Getting-meson.html).
+  Fossil CUBE uses Meson for build configuration. If you don’t have Meson installed, see the official [Meson website](https://mesonbuild.com/Getting-meson.html).
 
 ### Adding Fossil CUBE as a Dependency
 
