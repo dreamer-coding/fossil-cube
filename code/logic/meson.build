@@ -11,7 +11,7 @@ endif
 fossil_cube_lib = static_library('fossil-cube',
     files('cube.c'),
     install: true,
-    dependencies: [cc.find_library('m', required: false), dependency('opengl'), winsock_dep],
+    dependencies: [cc.find_library('m', required: false), dependency('opengl', ['OpenGL::GL', 'OpenGL::GLU']), winsock_dep],
     include_directories: dir)
 
 fossil_cube_dep = declare_dependency(
