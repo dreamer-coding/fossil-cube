@@ -22,7 +22,7 @@ extern "C"
 {
 #endif
 
- Basic types */
+/* Basic types */
 typedef uint32_t fc_color_t; /* 0xAARRGGBB */
 typedef struct { float x,y; } fc_vec2;
 typedef struct { float x,y,z; } fc_vec3;
