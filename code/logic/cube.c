@@ -16,10 +16,15 @@
 #include <string.h>
 #include <stdio.h>
 
-#ifdef _WIN32
-#include <windows.h>
+// cube.c
+#if defined(_WIN32) || defined(_WIN64)
+    #include <windows.h>   // Must be included before gl.h on Windows
+    #include <GL/gl.h>
+#elif defined(__APPLE__)
+    #include <OpenGL/gl.h>
+#else
+    #include <GL/gl.h>
 #endif
-#include <GL/gl.h>
 
 struct fossil_cube_ctx {
     void *platform_user_data;
