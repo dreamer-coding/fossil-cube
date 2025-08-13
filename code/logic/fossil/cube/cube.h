@@ -17,100 +17,132 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C"
-{
+#if defined(_WIN32) || defined(_WIN64)
+    #include <windows.h>   /* must come before gl.h */
+    #include <GL/gl.h>
+#elif defined(__APPLE__)
+    #include <OpenGL/gl.h>
+#else
+    #include <GL/gl.h>
 #endif
 
-/* Basic types */
-typedef uint32_t fc_color_t; /* 0xAARRGGBB */
-typedef struct { float x,y; } fc_vec2;
-typedef struct { float x,y,z; } fc_vec3;
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* Opaque context */
-typedef struct fossil_cube_ctx fossil_cube_ctx;
+/* --------------------------------- Public Types --------------------------------- */
 
-/* Event types forwarded by platform backend */
-typedef enum {
-    FC_EVENT_NONE = 0,
-    FC_EVENT_KEY_DOWN,
-    FC_EVENT_KEY_UP,
-    FC_EVENT_MOUSE_MOVE,
-    FC_EVENT_MOUSE_BUTTON_DOWN,
-    FC_EVENT_MOUSE_BUTTON_UP,
-    FC_EVENT_SCROLL,
-    FC_EVENT_WINDOW_RESIZE,
-} fossil_cube_event_type;
+typedef struct { float x, y; } fossil_cube_v2;
+typedef struct { float r, g, b, a; } fossil_cube_color;
+typedef struct { float x, y, w, h; } fossil_cube_rect;
 
 typedef struct {
-    fossil_cube_event_type type;
-    union {
-        struct { int key; int mods; } key;
-        struct { int button; int mods; } mouse_button;
-        struct { double x; double y; } mouse_move;
-        struct { double offset_x; double offset_y; } scroll;
-        struct { int width; int height; } resize;
-    } d;
-} fossil_cube_event;
+    /* Mouse */
+    int mouse_down[3];     /* 0:Left 1:Right 2:Middle */
+    int mouse_clicked[3];  /* set true on transition down this frame (optional helper) */
+    fossil_cube_v2 mouse_pos;  /* in framebuffer pixels */
+    fossil_cube_v2 mouse_delta;
 
-/* Callbacks user can set */
-typedef void (*fossil_cube_render_cb)(fossil_cube_ctx *ctx, void *user);
-typedef void (*fossil_cube_event_cb)(fossil_cube_ctx *ctx, const fossil_cube_event *ev, void *user);
+    /* Keyboard (minimal immediate-mode flags; extend as you like) */
+    int key_ctrl;
+    int key_shift;
+    int key_alt;
+    int key_super;
 
-/* Initialization flags (future) */
-enum { FC_INIT_NONE = 0 };
+    /* Wheel (positive up) */
+    float wheel_y;
 
-// *****************************************************************************
-// Function prototypes
-// *****************************************************************************
+    /* Viewport info (optional overrides – otherwise context values used) */
+    int fb_w, fb_h;        /* framebuffer size */
+    float dpi_scale;       /* 1.0 = 96 DPI */
+} fossil_cube_input;
 
-/* Create/destroy context
-   platform_user_data: opaque pointer supplied by platform backend for callbacks,
-   width/height: initial framebuffer size in pixels
-*/
-fossil_cube_ctx *fossil_cube_create(void *platform_user_data, int width, int height, int flags);
-void fossil_cube_destroy(fossil_cube_ctx *c);
+typedef struct fossil_cube_ctx fossil_cube_ctx;
 
-/* Set callbacks */
-void fossil_cube_set_render_callback(fossil_cube_ctx *c, fossil_cube_render_cb cb, void *user);
-void fossil_cube_set_event_callback(fossil_cube_ctx *c, fossil_cube_event_cb ecb, void *user);
+typedef struct {
+    GLuint id;
+    int w, h;
+} fossil_cube_texture;
 
-/* Frame lifecycle - called by platform backend once per frame */
-void fossil_cube_frame_begin(fossil_cube_ctx *c, double dt_seconds);
-void fossil_cube_frame_end(fossil_cube_ctx *c);
+/* ------------------------------- Public Constants ------------------------------- */
 
-/* Feed events into the core */
-void fossil_cube_push_event(fossil_cube_ctx *c, const fossil_cube_event *ev);
+enum {
+    FOSSIL_CUBE_MAX_CMD    = 16384,
+    FOSSIL_CUBE_MAX_VTX    = 131072,
+    FOSSIL_CUBE_MAX_IDX    = 262144
+};
 
-/* Basic drawing primitives (immediate mode) */
+/* --------------------------------- Public API ---------------------------------- */
 
-/* State: color (applies to untextured rects/lines) */
-void fossil_cube_set_color(fossil_cube_ctx *c, fc_color_t color);
+/* Lifecycle */
+fossil_cube_ctx* fossil_cube_create_context(int fb_w, int fb_h, float dpi_scale);
+void             fossil_cube_destroy_context(fossil_cube_ctx* ctx);
+void             fossil_cube_resize(fossil_cube_ctx* ctx, int fb_w, int fb_h, float dpi_scale);
 
-/* Rect: x,y origin with width/height (x,y are in screen pixels with origin top-left) */
-void fossil_cube_draw_rect(fossil_cube_ctx *c, float x, float y, float w, float h);
+/* Per-frame */
+void fossil_cube_new_frame(fossil_cube_ctx* ctx, const fossil_cube_input* in, double dt_seconds);
+void fossil_cube_render(fossil_cube_ctx* ctx);
 
-/* Filled circle (approx) */
-void fossil_cube_draw_circle(fossil_cube_ctx *c, float cx, float cy, float r, int segments);
+/* Style */
+typedef struct {
+    fossil_cube_color clear_color;     /* background (used if you want ui to clear)      */
+    fossil_cube_color panel_bg;        /* window bg                                      */
+    fossil_cube_color panel_border;
+    fossil_cube_color text;
+    fossil_cube_color button;
+    fossil_cube_color button_hot;
+    fossil_cube_color button_active;
+    fossil_cube_color slider_bg;
+    fossil_cube_color slider_knob;
+    float padding;                     /* panel inner padding                             */
+    float item_spacing;                /* between widgets                                 */
+    float roundness;                   /* corners (0 = sharp)                             */
+    float font_px;                     /* base font size (pixels)                         */
+} fossil_cube_style;
 
-/* Textured quad: user supplies an OpenGL texture id */
-void fossil_cube_draw_textured_quad(fossil_cube_ctx *c, unsigned int gl_texture, 
-                                    float x, float y, float w, float h, float u0, float v0, float u1, float v1);
+void fossil_cube_get_style(fossil_cube_ctx* ctx, fossil_cube_style* out_style);
+void fossil_cube_set_style(fossil_cube_ctx* ctx, const fossil_cube_style* in_style);
+void fossil_cube_style_reset_default(fossil_cube_style* st);
 
-/* Simple GPU resource helpers */
-unsigned int fossil_cube_create_texture_from_rgba8(fossil_cube_ctx *c, const void *rgba, int width, int height);
-void fossil_cube_destroy_texture(fossil_cube_ctx *c, unsigned int tex);
+/* Text & basic draw (public helpers if you need them) */
+float fossil_cube_text_width(fossil_cube_ctx* ctx, const char* text);
+float fossil_cube_text_height(fossil_cube_ctx* ctx); /* equals style.font_px */
+void  fossil_cube_draw_text(fossil_cube_ctx* ctx, float x, float y, const char* text, fossil_cube_color c);
+void  fossil_cube_draw_rect(fossil_cube_ctx* ctx, fossil_cube_rect r, fossil_cube_color c, float round);
+void  fossil_cube_draw_rect_line(fossil_cube_ctx* ctx, fossil_cube_rect r, float thickness, fossil_cube_color c, float round);
 
-/* Utility: convert 8-bit RGBA components to fc_color_t */
-static inline fc_color_t fossil_cube_rgba8(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
-    return ((uint32_t)a<<24) | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
-}
+/* Textures */
+fossil_cube_texture fossil_cube_texture_create(const void* rgba8_pixels, int w, int h, int linear_filter);
+void                fossil_cube_texture_destroy(fossil_cube_texture* t);
 
-/* Simple debug drawing toggle */
-void fossil_cube_enable_debug_draw(fossil_cube_ctx *c, int enable);
+/* Immediate-mode UI */
+int  fossil_cube_begin_window(fossil_cube_ctx* ctx, const char* title, float x, float y, float w, float h, int* open_opt);
+void fossil_cube_end_window(fossil_cube_ctx* ctx);
+
+void fossil_cube_label(fossil_cube_ctx* ctx, const char* text);
+
+/* returns 1 if clicked this frame */
+int  fossil_cube_button(fossil_cube_ctx* ctx, const char* label);
+
+/* returns 1 if value changed */
+int  fossil_cube_slider(fossil_cube_ctx* ctx, const char* label, float* value, float min_v, float max_v, float step);
+
+/* Image widget (draws an RGBA texture) */
+void fossil_cube_image(fossil_cube_ctx* ctx, fossil_cube_texture tex, float w, float h);
+
+/* Layout helpers */
+void fossil_cube_same_line(fossil_cube_ctx* ctx);      /* place next item on same line */
+void fossil_cube_spacing(fossil_cube_ctx* ctx, float px); /* vertical spacing push */
+
+/* Optional: tell UI to clear background using style.clear_color (default off) */
+void fossil_cube_set_clear_background(fossil_cube_ctx* ctx, int enabled);
 
 /* Version */
-const char *fossil_cube_version(void);
+const char* fossil_cube_version(void); /* "Fossil CUBE x.y.z" */
+
+/* --------------------------------- Utilities ----------------------------------- */
+static inline fossil_cube_color fossil_cube_rgba(float r,float g,float b,float a){ fossil_cube_color c={r,g,b,a}; return c; }
+static inline fossil_cube_rect  fossil_cube_rect_xywh(float x,float y,float w,float h){ fossil_cube_rect r={x,y,w,h}; return r; }
 
 #ifdef __cplusplus
 }
