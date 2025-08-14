@@ -30,63 +30,22 @@
 extern "C" {
 #endif
 
-/* Result codes */
-typedef enum fossil_cube_result {
-    FOSSIL_CUBE_OK = 0,
-    FOSSIL_CUBE_ERR_BADARGS = -1,
-    FOSSIL_CUBE_ERR_OOM = -2,
-    FOSSIL_CUBE_ERR_NOTINIT = -3
-} fossil_cube_result;
+typedef struct {
+    int width;
+    int height;
+    uint32_t *pixels; // RGBA8888
+    void *platform;   // OS-specific data
+} fossil_cube_t;
 
-/* Present callback:
-   - pixels: pointer to tightly-packed RGBA8 buffer (row-major)
-   - width/height: size in pixels
-   - pitch: bytes per row (always width*4 in this core)
-   - userdata: passthrough pointer you supplied at init
-*/
-typedef void (*fossil_cube_present_fn)(
-    const uint8_t* pixels, int width, int height, int pitch, void* userdata);
+bool fossil_cube_init(fossil_cube_t *cube, int width, int height, const char *title);
+void fossil_cube_shutdown(fossil_cube_t *cube);
 
-/* Init / Shutdown */
-fossil_cube_result fossil_cube_init(
-    int width, int height,
-    fossil_cube_present_fn present,
-    void* userdata);
+void fossil_cube_draw_pixel(fossil_cube_t *cube, int x, int y, uint32_t color);
+void fossil_cube_clear(fossil_cube_t *cube, uint32_t color);
 
-void fossil_cube_shutdown(void);
+void fossil_cube_present(fossil_cube_t *cube); // Blit framebuffer to window
 
-/* Resize the internal framebuffer (contents are undefined after) */
-fossil_cube_result fossil_cube_resize(int new_width, int new_height);
-
-/* Begin/End frame workflow */
-void fossil_cube_begin_frame(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-void fossil_cube_end_frame(void); /* calls your present() */
-
-/* Immediate 2D drawing (software) */
-void fossil_cube_clear(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-void fossil_cube_set_clip(int x, int y, int w, int h); /* set clip rect; w/h<=0 disables clipping */
-void fossil_cube_get_clip(int* x, int* y, int* w, int* h);
-
-void fossil_cube_put_pixel(int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-
-/* Filled rectangle (alpha-blended) */
-void fossil_cube_fill_rect(int x, int y, int w, int h,
-                           uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-
-/* 1px line (alpha-blended) using Bresenham */
-void fossil_cube_draw_line(int x0, int y0, int x1, int y1,
-                           uint8_t r, uint8_t g, uint8_t b, uint8_t a);
-
-/* Blit a source RGBA buffer (premultiplied or straight? -> straight alpha expected) */
-void fossil_cube_blit_rgba(int dst_x, int dst_y,
-                           const uint8_t* src, int src_w, int src_h, int src_pitch);
-
-/* Access to the raw framebuffer if the app wants to do custom drawing */
-uint8_t* fossil_cube_framebuffer(int* out_w, int* out_h, int* out_pitch);
-
-/* Utilities */
-int fossil_cube_width(void);
-int fossil_cube_height(void);
+bool fossil_cube_poll_event(fossil_cube_t *cube, int *event_type, int *p1, int *p2);
 
 #ifdef __cplusplus
 }
