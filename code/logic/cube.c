@@ -17,18 +17,36 @@
 
 #if defined(_WIN32) || defined(_WIN64)
     #include <windows.h>
-    static HMODULE s_opengl32 = NULL;
-    typedef PROC (WINAPI *PFNWGLGETPROCADDRESSPROC)(LPCSTR);
-    static PFNWGLGETPROCADDRESSPROC s_wglGetProcAddress = NULL;
+    #include <GL/gl.h>
+    #include <GL/glext.h>
 #elif defined(__APPLE__)
-    /* macOS: link-time symbols from OpenGL framework; no runtime loading needed. */
-    #include <dlfcn.h>
+    #include <OpenGL/gl3.h> // Core profile functions
+    // Manually define missing PFNGL...PROC typedefs
+    typedef GLuint (*PFNGLCREATESHADERPROC)(GLenum type);
+    typedef void   (*PFNGLSHADERSOURCEPROC)(GLuint shader, GLsizei count, const GLchar *const*string, const GLint *length);
+    typedef void   (*PFNGLCOMPILESHADERPROC)(GLuint shader);
+    typedef void   (*PFNGLGETSHADERIVPROC)(GLuint shader, GLenum pname, GLint *params);
+    typedef void   (*PFNGLGETSHADERINFOLOGPROC)(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog);
+    typedef void   (*PFNGLDELETESHADERPROC)(GLuint shader);
+    typedef GLuint (*PFNGLCREATEPROGRAMPROC)(void);
+    typedef void   (*PFNGLATTACHSHADERPROC)(GLuint program, GLuint shader);
+    typedef void   (*PFNGLLINKPROGRAMPROC)(GLuint program);
+    typedef void   (*PFNGLGETPROGRAMIVPROC)(GLuint program, GLenum pname, GLint *params);
+    typedef void   (*PFNGLGETPROGRAMINFOLOGPROC)(GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog);
+    typedef void   (*PFNGLDELETEPROGRAMPROC)(GLuint program);
+    typedef void   (*PFNGLUSEPROGRAMPROC)(GLuint program);
+    typedef GLint  (*PFNGLGETUNIFORMLOCATIONPROC)(GLuint program, const GLchar *name);
+    typedef void   (*PFNGLUNIFORM1IPROC)(GLint location, GLint v0);
+    typedef void   (*PFNGLUNIFORM1FPROC)(GLint location, GLfloat v0);
+    typedef void   (*PFNGLUNIFORM2FPROC)(GLint location, GLfloat v0, GLfloat v1);
+    typedef void   (*PFNGLUNIFORM3FPROC)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2);
+    typedef void   (*PFNGLUNIFORM4FPROC)(GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3);
 #else
-    #include <dlfcn.h>
-    #include <GL/glx.h>
-    typedef void* (*PFNGLXGETPROCADDRESSPROC)(const GLubyte*);
-    static PFNGLXGETPROCADDRESSPROC s_glXGetProcAddress = NULL;
+    #include <GL/gl.h>
+    #include <GL/glext.h>
 #endif
+
+#include <stdarg.h> // for va_start / va_end
 
 #include <stdarg.h>
 
