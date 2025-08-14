@@ -11,593 +11,664 @@
  * Copyright (C) 2024 Fossil Logic. All rights reserved.
  * -----------------------------------------------------------------------------
  */
-#define FOSSIL_CUBE_IMPLEMENTATION
 #include "fossil/cube/cube.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <time.h>
 
-/* --------------------------------------------------------------
- * Common internal state and helpers
- * -------------------------------------------------------------- */
+#if defined(_WIN32) || defined(_WIN64)
+    #include <windows.h>
+    #include <GL/gl.h>
+    /* WGL extension pointer types (minimal set we use) */
+    typedef const char* (WINAPI *PFNWGLGETEXTENSIONSSTRINGARBPROC)(HDC);
+    typedef BOOL (WINAPI *PFNWGLSWAPINTERVALEXTPROC)(int);
+    typedef int  (WINAPI *PFNWGLGETSWAPINTERVALEXTPROC)(void);
+    static PFNWGLGETEXTENSIONSSTRINGARBPROC wglGetExtensionsStringARB_;
+    static PFNWGLSWAPINTERVALEXTPROC        wglSwapIntervalEXT_;
+    static PFNWGLGETSWAPINTERVALEXTPROC     wglGetSwapIntervalEXT_;
+#elif defined(__APPLE__)
+    #include <dlfcn.h>
+    #include <sys/time.h>
+    /* OpenGL is provided by the system; context is expected via attach API. */
+#else
+    /* Linux / X11 + GLX */
+    #include <X11/Xlib.h>
+    #include <X11/Xutil.h>
+    #include <X11/Xatom.h>
+    #include <GL/glx.h>
+    typedef GLXContext (*PFNGLXCREATECONTEXTATTRIBSARBPROC)(Display*, GLXFBConfig, GLXContext, Bool, const int*);
+    typedef void* (*PFNGLXGETPROCADDRESSARBPROC)(const GLubyte*);
+    static PFNGLXCREATECONTEXTATTRIBSARBPROC glXCreateContextAttribsARB_;
+    static PFNGLXGETPROCADDRESSARBPROC       glXGetProcAddressARB_;
+#endif
 
-struct fossil_cube_window_t {
-    int width;
-    int height;
-    int double_buffer;
-    int headless;      /* 1 for macOS CGL pbuffer path */
+/* --- Minimal modern GL function pointers (loaded at runtime where required) --- */
+/* We keep this tiny: shaders, program, buffers, vertex arrays, attribs, textures, draw. */
+#define GL_FUNC(ret, name, args) typedef ret (APIENTRY *PFN_##name) args; static PFN_##name name;
+#if defined(_WIN32) || defined(_WIN64)
+    #define GL_LOAD(name) name = (PFN_##name)wglGetProcAddress(#name); if(!(name)) name = (PFN_##name)GetProcAddress(GetModuleHandleA("opengl32.dll"), #name)
+#elif defined(__APPLE__)
+    #define GL_LOAD(name) name = (PFN_##name)dlsym(RTLD_DEFAULT, #name)
+#else
+    #define GL_LOAD(name) name = (PFN_##name)glXGetProcAddressARB_((const GLubyte*)#name)
+#endif
+
+/* Core we use (available since GL 2.0+, VAO 3.0 or ARB ext) */
+GL_FUNC(GLuint, glCreateShader, (GLenum))
+GL_FUNC(void,   glShaderSource, (GLuint, GLsizei, const GLchar* const*, const GLint*))
+GL_FUNC(void,   glCompileShader, (GLuint))
+GL_FUNC(void,   glGetShaderiv, (GLuint, GLenum, GLint*))
+GL_FUNC(void,   glGetShaderInfoLog, (GLuint, GLsizei, GLsizei*, GLchar*))
+GL_FUNC(GLuint, glCreateProgram, (void))
+GL_FUNC(void,   glAttachShader, (GLuint, GLuint))
+GL_FUNC(void,   glLinkProgram, (GLuint))
+GL_FUNC(void,   glGetProgramiv, (GLuint, GLenum, GLint*))
+GL_FUNC(void,   glGetProgramInfoLog, (GLuint, GLsizei, GLsizei*, GLchar*))
+GL_FUNC(void,   glDeleteShader, (GLuint))
+GL_FUNC(void,   glDeleteProgram, (GLuint))
+GL_FUNC(void,   glUseProgram, (GLuint))
+GL_FUNC(void,   glGenBuffers, (GLsizei, GLuint*))
+GL_FUNC(void,   glBindBuffer, (GLenum, GLuint))
+GL_FUNC(void,   glBufferData, (GLenum, ptrdiff_t, const void*, GLenum))
+GL_FUNC(void,   glEnableVertexAttribArray, (GLuint))
+GL_FUNC(void,   glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*))
+GL_FUNC(void,   glDisableVertexAttribArray, (GLuint))
+/* VAOs (may be missing on GL 2.1; we handle gracefully) */
+GL_FUNC(void,   glGenVertexArrays, (GLsizei, GLuint*))
+GL_FUNC(void,   glBindVertexArray, (GLuint))
+GL_FUNC(void,   glDeleteVertexArrays, (GLsizei, const GLuint*))
+/* Textures (needed by many apps; still non-deprecated) */
+GL_FUNC(void,   glActiveTexture, (GLenum))
+GL_FUNC(void,   glGenTextures, (GLsizei, GLuint*))
+GL_FUNC(void,   glBindTexture, (GLenum, GLuint))
+GL_FUNC(void,   glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void*))
+GL_FUNC(void,   glTexParameteri, (GLenum, GLenum, GLint))
+GL_FUNC(void,   glGenerateMipmap, (GLenum))
+GL_FUNC(void,   glDeleteTextures, (GLsizei, const GLuint*))
+/* Draw */
+GL_FUNC(void,   glDrawArrays, (GLenum, GLint, GLsizei))
+GL_FUNC(void,   glDrawElements, (GLenum, GLsizei, GLenum, const void*))
+/* Uniforms */
+GL_FUNC(GLint,  glGetUniformLocation, (GLuint, const GLchar*))
+GL_FUNC(void,   glUniform1i, (GLint, GLint))
+GL_FUNC(void,   glUniform1f, (GLint, GLfloat))
+GL_FUNC(void,   glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))
+GL_FUNC(void,   glUniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*))
+
+/* Internal: try to load above pointers; return 1 on success (partial OK). */
+static int cube_load_gl_procs(void) {
+    int ok = 1;
+    GL_LOAD(glCreateShader);
+    GL_LOAD(glShaderSource);
+    GL_LOAD(glCompileShader);
+    GL_LOAD(glGetShaderiv);
+    GL_LOAD(glGetShaderInfoLog);
+    GL_LOAD(glCreateProgram);
+    GL_LOAD(glAttachShader);
+    GL_LOAD(glLinkProgram);
+    GL_LOAD(glGetProgramiv);
+    GL_LOAD(glGetProgramInfoLog);
+    GL_LOAD(glDeleteShader);
+    GL_LOAD(glDeleteProgram);
+    GL_LOAD(glUseProgram);
+    GL_LOAD(glGenBuffers);
+    GL_LOAD(glBindBuffer);
+    GL_LOAD(glBufferData);
+    GL_LOAD(glEnableVertexAttribArray);
+    GL_LOAD(glVertexAttribPointer);
+    GL_LOAD(glDisableVertexAttribArray);
+
+    /* VAO may be NULL on GL 2.1 (OK). */
+    GL_LOAD(glGenVertexArrays);
+    GL_LOAD(glBindVertexArray);
+    GL_LOAD(glDeleteVertexArrays);
+
+    GL_LOAD(glActiveTexture);
+    GL_LOAD(glGenTextures);
+    GL_LOAD(glBindTexture);
+    GL_LOAD(glTexImage2D);
+    GL_LOAD(glTexParameteri);
+    GL_LOAD(glGenerateMipmap);
+    GL_LOAD(glDeleteTextures);
+
+    GL_LOAD(glDrawArrays);
+    GL_LOAD(glDrawElements);
+    GL_LOAD(glGetUniformLocation);
+    GL_LOAD(glUniform1i);
+    GL_LOAD(glUniform1f);
+    GL_LOAD(glUniform4f);
+    GL_LOAD(glUniformMatrix4fv);
+
+    /* A few critical ones must exist (shaders/program/buffers) */
+    ok = ok && glCreateShader && glCreateProgram && glGenBuffers && glVertexAttribPointer;
+    return ok ? 1 : 0;
+}
+
+/* --- Internal state --- */
+struct fossil_cube_t {
+    int width, height;
+    int should_close;
     int vsync;
 
 #if defined(_WIN32) || defined(_WIN64)
-    HWND   hwnd;
-    HDC    hdc;
-    HGLRC  hglrc;
-    int    close_requested;
+    HINSTANCE   hinst;
+    HWND        hwnd;
+    HDC         hdc;
+    HGLRC       hglrc;
+    LARGE_INTEGER perf_freq;
+    LARGE_INTEGER start_qpc;
 #elif defined(__APPLE__)
-    /* Pure C headless via CGL pbuffer */
-    void*  cgl_ctx;        /* CGLContextObj */
-    void*  cgl_pbuffer;    /* CGLPBufferObj */
+    void*       ns_window;
+    void*       ns_view;
+    void*       ns_glctx; /* NSOpenGLContext* */
+    double      start_time;
 #else
-    /* X11 + GLX */
-    Display* dpy;
-    Window   win;
-    GLXContext ctx;
-    Colormap cmap;
-    Atom     wm_delete;
-    int      close_requested;
+    Display*    dpy;
+    int         screen;
+    Window      win;
+    GLXContext  ctx;
+    Atom        wm_delete;
+    struct timespec start_ts;
 #endif
 };
 
-/* Static flags */
-static int g_inited = 0;
-
-/* Error strings */
-const char* fossil_cube_strerror(fossil_cube_result_t err) {
-    switch (err) {
-        case FOSSIL_CUBE_OK: return "OK";
-        case FOSSIL_CUBE_ERR_GENERIC: return "Generic error";
-        case FOSSIL_CUBE_ERR_PLATFORM: return "Platform error";
-        case FOSSIL_CUBE_ERR_NO_DISPLAY: return "No display found";
-        case FOSSIL_CUBE_ERR_CREATE_WINDOW: return "Failed to create window";
-        case FOSSIL_CUBE_ERR_CREATE_CONTEXT: return "Failed to create GL context";
-        case FOSSIL_CUBE_ERR_MAKE_CURRENT: return "Failed to make context current";
-        case FOSSIL_CUBE_ERR_GL_LOADER: return "Failed to resolve GL procedure";
-        case FOSSIL_CUBE_ERR_HEADLESS_ONLY: return "This platform build is headless-only";
-        default: return "Unknown error";
-    }
-}
-
-fossil_cube_result_t fossil_cube_init(void) {
-    if (g_inited) return FOSSIL_CUBE_OK;
+/* --- Timing --- */
+static double cube_now_seconds_win(LARGE_INTEGER freq) {
 #if defined(_WIN32) || defined(_WIN64)
-    /* Nothing global needed. */
-    g_inited = 1;
-    return FOSSIL_CUBE_OK;
-#elif defined(__APPLE__)
-    /* No global init required for CGL. */
-    g_inited = 1;
-    return FOSSIL_CUBE_OK;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return (double)(q.QuadPart) / (double)freq.QuadPart;
 #else
-    /* X11 has per-window Display; no global init needed. */
-    g_inited = 1;
-    return FOSSIL_CUBE_OK;
+    (void)freq; return 0.0;
 #endif
 }
 
-void fossil_cube_shutdown(void) {
-    g_inited = 0;
+static double cube_now_seconds_posix(void) {
+#if defined(__APPLE__)
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec * 1.0e-6;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
+#endif
 }
 
-/* Forward decls per-platform */
-static fossil_cube_window_t* cube_create_platform(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err);
-static void cube_destroy_platform(fossil_cube_window_t* win);
-static fossil_cube_result_t cube_make_current_platform(fossil_cube_window_t* win);
-static void cube_swap_buffers_platform(fossil_cube_window_t* win);
-static void cube_poll_events_platform(fossil_cube_window_t* win, fossil_cube_events_t* out_events);
-static void cube_set_vsync_platform(fossil_cube_window_t* win, int interval);
-static void* cube_get_proc_address_platform(const char* name);
+/* --- Platform: Windows (WGL) --- */
+#if defined(_WIN32) || defined(_WIN64)
 
-fossil_cube_window_t* fossil_cube_create(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err) {
-    if (!g_inited) fossil_cube_init();
-    fossil_cube_result_t dummy;
-    if (!out_err) out_err = &dummy;
-    if (!cfg) { *out_err = FOSSIL_CUBE_ERR_GENERIC; return NULL; }
-    return cube_create_platform(cfg, out_err);
+static LRESULT CALLBACK cube_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    fossil_cube_t* cube = (fossil_cube_t*)GetWindowLongPtr(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_CLOSE:
+        if (cube) cube->should_close = 1;
+        return 0;
+    case WM_SIZE:
+        if (cube) {
+            RECT rc; GetClientRect(h, &rc);
+            cube->width = (int)(rc.right - rc.left);
+            cube->height = (int)(rc.bottom - rc.top);
+        }
+        break;
+    }
+    return DefWindowProc(h, m, w, l);
 }
 
-void fossil_cube_destroy(fossil_cube_window_t* win) {
-    if (!win) return;
-    cube_destroy_platform(win);
-}
-
-fossil_cube_result_t fossil_cube_make_current(fossil_cube_window_t* win) {
-    if (!win) return FOSSIL_CUBE_ERR_GENERIC;
-    return cube_make_current_platform(win);
-}
-
-void fossil_cube_swap_buffers(fossil_cube_window_t* win) {
-    if (!win) return;
-    cube_swap_buffers_platform(win);
-}
-
-void fossil_cube_poll_events(fossil_cube_window_t* win, fossil_cube_events_t* out_events) {
-    if (!out_events) return;
-    memset(out_events, 0, sizeof(*out_events));
-    if (!win) return;
-    cube_poll_events_platform(win, out_events);
-}
-
-void fossil_cube_set_vsync(fossil_cube_window_t* win, int interval) {
-    if (!win) return;
-    cube_set_vsync_platform(win, interval);
-}
-
-void* fossil_cube_get_proc_address(const char* name) {
-    return cube_get_proc_address_platform(name);
-}
-
-int fossil_cube_width(const fossil_cube_window_t* win)  { return win ? win->width  : 0; }
-int fossil_cube_height(const fossil_cube_window_t* win) { return win ? win->height : 0; }
-int fossil_cube_is_headless(const fossil_cube_window_t* win) { return win ? win->headless : 0; }
-
-/* Minimal helper: poll + swap; returns 0 if close requested */
-int fossil_cube_frame(fossil_cube_window_t* win, fossil_cube_events_t* ev) {
-    fossil_cube_poll_events(win, ev);
-    if (ev && ev->should_close) return 0;
-    fossil_cube_swap_buffers(win);
+static int cube_wgl_init_extensions(HDC hdc) {
+    wglGetExtensionsStringARB_ = (PFNWGLGETEXTENSIONSSTRINGARBPROC)wglGetProcAddress("wglGetExtensionsStringARB");
+    if (wglGetExtensionsStringARB_) {
+        const char* ext = wglGetExtensionsStringARB_(hdc);
+        (void)ext;
+    }
+    wglSwapIntervalEXT_    = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
+    wglGetSwapIntervalEXT_ = (PFNWGLGETSWAPINTERVALEXTPROC)wglGetProcAddress("wglGetSwapIntervalEXT");
     return 1;
 }
 
-/* --------------------------------------------------------------
- * Windows (Win32 + WGL)
- * -------------------------------------------------------------- */
-#if defined(_WIN32) || defined(_WIN64)
-
-static LRESULT CALLBACK cube_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    fossil_cube_window_t* win = (fossil_cube_window_t*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-    switch (msg) {
-        case WM_CLOSE:
-            if (win) win->headless = 0; /* no-op, but keep compiler happy */
-            PostQuitMessage(0);
-            return 0;
-        case WM_SIZE:
-            if (win) {
-                win->width  = LOWORD(lParam);
-                win->height = HIWORD(lParam);
-            }
-            break;
-        default:
-            break;
-    }
-    return DefWindowProc(hWnd, msg, wParam, lParam);
-}
-
-/* wglSwapIntervalEXT loader */
-typedef BOOL (WINAPI *PFNWGLSWAPINTERVALEXTPROC)(int);
-static PFNWGLSWAPINTERVALEXTPROC p_wglSwapIntervalEXT = NULL;
-
-static void cube_win_try_load_swapinterval(void) {
-    if (!p_wglSwapIntervalEXT) {
-        p_wglSwapIntervalEXT = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
-    }
-}
-
-static fossil_cube_window_t* cube_create_platform(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err) {
-    *out_err = FOSSIL_CUBE_ERR_GENERIC;
-
-    WNDCLASSA wc = {0};
+static int cube_win_create(const fossil_cube_config* cfg, fossil_cube_t** out) {
+    WNDCLASSA wc;
+    memset(&wc, 0, sizeof(wc));
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = cube_wndproc;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "FossilCubeWndClass";
-
-    if (!RegisterClassA(&wc)) {
-        /* Might be already registered; ignore failure if so */
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "FossilCube_wnd";
+    if (!RegisterClassA(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return FOSSIL_CUBE_ERR_PLATFORM;
     }
 
     DWORD style = WS_OVERLAPPEDWINDOW;
-    RECT rect = {0, 0, cfg->width > 0 ? cfg->width : 640, cfg->height > 0 ? cfg->height : 480};
-    AdjustWindowRect(&rect, style, FALSE);
+    RECT wr = {0,0,cfg->width,cfg->height};
+    AdjustWindowRect(&wr, style, FALSE);
 
     HWND hwnd = CreateWindowA(
         wc.lpszClassName,
         cfg->title ? cfg->title : "Fossil CUBE",
         style,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        rect.right - rect.left, rect.bottom - rect.top,
-        NULL, NULL, wc.hInstance, NULL
-    );
-    if (!hwnd) { *out_err = FOSSIL_CUBE_ERR_CREATE_WINDOW; return NULL; }
+        wr.right - wr.left, wr.bottom - wr.top,
+        NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) return FOSSIL_CUBE_ERR_PLATFORM;
 
     HDC hdc = GetDC(hwnd);
 
-    PIXELFORMATDESCRIPTOR pfd = {0};
-    pfd.nSize = sizeof(PIXELFORMATDESCRIPTOR);
+    /* Basic pixel format (32-bit color, 24/8 depth/stencil, double-buffer). */
+    PIXELFORMATDESCRIPTOR pfd;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.nSize = sizeof(pfd);
     pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | (cfg->double_buffer ? PFD_DOUBLEBUFFER : 0);
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
     pfd.iPixelType = PFD_TYPE_RGBA;
-    pfd.cColorBits = (BYTE)(cfg->color_bits ? cfg->color_bits : 24);
-    pfd.cDepthBits = (BYTE)(cfg->depth_bits ? cfg->depth_bits : 24);
-    pfd.cStencilBits = (BYTE)(cfg->stencil_bits ? cfg->stencil_bits : 8);
+    pfd.cColorBits = 32;
+    pfd.cDepthBits = 24;
+    pfd.cStencilBits = 8;
     pfd.iLayerType = PFD_MAIN_PLANE;
 
     int pf = ChoosePixelFormat(hdc, &pfd);
-    if (pf == 0 || !SetPixelFormat(hdc, pf, &pfd)) {
+    if (!pf || !SetPixelFormat(hdc, pf, &pfd)) {
         DestroyWindow(hwnd);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
+        return FOSSIL_CUBE_ERR_PLATFORM;
     }
 
     HGLRC hglrc = wglCreateContext(hdc);
-    if (!hglrc) {
+    if (!hglrc || !wglMakeCurrent(hdc, hglrc)) {
+        if (hglrc) wglDeleteContext(hglrc);
         DestroyWindow(hwnd);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
+        return FOSSIL_CUBE_ERR_GL;
     }
 
-    fossil_cube_window_t* win = (fossil_cube_window_t*)calloc(1, sizeof(*win));
-    win->width  = cfg->width  > 0 ? cfg->width  : 640;
-    win->height = cfg->height > 0 ? cfg->height : 480;
-    win->double_buffer = cfg->double_buffer ? 1 : 0;
-    win->headless = 0;
-    win->hwnd = hwnd;
-    win->hdc = hdc;
-    win->hglrc = hglrc;
+    /* Load WGL + GL procs */
+    cube_wgl_init_extensions(hdc);
+    cube_load_gl_procs();
 
-    SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)win);
+    /* Show the window */
     ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
 
-    if (wglMakeCurrent(hdc, hglrc) == FALSE) {
-        fossil_cube_destroy(win);
-        *out_err = FOSSIL_CUBE_ERR_MAKE_CURRENT;
-        return NULL;
+    /* Instance */
+    fossil_cube_t* cube = (fossil_cube_t*)calloc(1, sizeof(*cube));
+    if (!cube) {
+        wglMakeCurrent(NULL, NULL);
+        wglDeleteContext(hglrc);
+        DestroyWindow(hwnd);
+        return FOSSIL_CUBE_ERR_ALLOC;
     }
 
-    cube_win_try_load_swapinterval();
-    if (cfg->vsync && p_wglSwapIntervalEXT) p_wglSwapIntervalEXT(1);
+    cube->hinst = wc.hInstance;
+    cube->hwnd = hwnd;
+    cube->hdc = hdc;
+    cube->hglrc = hglrc;
 
-    *out_err = FOSSIL_CUBE_OK;
-    return win;
-}
+    RECT rc; GetClientRect(hwnd, &rc);
+    cube->width = (int)(rc.right - rc.left);
+    cube->height = (int)(rc.bottom - rc.top);
 
-static void cube_destroy_platform(fossil_cube_window_t* win) {
-    if (!win) return;
-    if (win->hglrc) { wglMakeCurrent(NULL, NULL); wglDeleteContext(win->hglrc); }
-    if (win->hwnd && win->hdc) { ReleaseDC(win->hwnd, win->hdc); }
-    if (win->hwnd) DestroyWindow(win->hwnd);
-    free(win);
-}
+    QueryPerformanceFrequency(&cube->perf_freq);
+    QueryPerformanceCounter(&cube->start_qpc);
 
-static fossil_cube_result_t cube_make_current_platform(fossil_cube_window_t* win) {
-    if (!wglMakeCurrent(win->hdc, win->hglrc)) return FOSSIL_CUBE_ERR_MAKE_CURRENT;
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)cube);
+
+    /* V-sync */
+    cube->vsync = cfg->vsync ? 1 : 0;
+    if (wglSwapIntervalEXT_) wglSwapIntervalEXT_(cube->vsync);
+
+    *out = cube;
     return FOSSIL_CUBE_OK;
 }
 
-static void cube_swap_buffers_platform(fossil_cube_window_t* win) {
-    if (win->double_buffer && win->hdc) SwapBuffers(win->hdc);
-}
+#endif /* Windows */
 
-static void cube_poll_events_platform(fossil_cube_window_t* win, fossil_cube_events_t* out_events) {
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT) out_events->should_close = 1;
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-    /* Update size from current client rect */
-    RECT r;
-    if (GetClientRect(win->hwnd, &r)) {
-        int w = r.right - r.left;
-        int h = r.bottom - r.top;
-        if (w != win->width || h != win->height) {
-            win->width = w; win->height = h;
-            out_events->resized = 1;
-            out_events->width = w;
-            out_events->height = h;
-        }
-    }
-}
+/* --- Platform: Linux (X11 + GLX) --- */
+#if !defined(_WIN32) && !defined(_WIN64) && !defined(__APPLE__)
 
-static void cube_set_vsync_platform(fossil_cube_window_t* win, int interval) {
-    (void)win;
-    cube_win_try_load_swapinterval();
-    if (p_wglSwapIntervalEXT) p_wglSwapIntervalEXT(interval ? 1 : 0);
-}
-
-static void* cube_get_proc_address_platform(const char* name) {
-    void* p = (void*)wglGetProcAddress(name);
-    if (!p) {
-        HMODULE lib = LoadLibraryA("opengl32.dll");
-        if (lib) p = (void*)GetProcAddress(lib, name);
-    }
-    return p;
-}
-
-/* --------------------------------------------------------------
- * macOS (CGL headless pbuffer)
- * -------------------------------------------------------------- */
-#elif defined(__APPLE__)
-
-#include <CoreFoundation/CoreFoundation.h>
-#include <OpenGL/CGLCurrent.h>
-#include <OpenGL/OpenGL.h>
-
-static fossil_cube_window_t* cube_create_platform(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err) {
-    *out_err = FOSSIL_CUBE_ERR_GENERIC;
-
-    CGLPixelFormatAttribute attrs[] = {
-        kCGLPFAAccelerated,
-        kCGLPFADoubleBuffer,        /* honored only for onscreen; harmless here */
-        kCGLPFAColorSize, (CGLPixelFormatAttribute)(cfg->color_bits ? cfg->color_bits : 24),
-        kCGLPFADepthSize, (CGLPixelFormatAttribute)(cfg->depth_bits ? cfg->depth_bits : 24),
-        kCGLPFAStencilSize, (CGLPixelFormatAttribute)(cfg->stencil_bits ? cfg->stencil_bits : 8),
-        (CGLPixelFormatAttribute)0
-    };
-
-    CGLPixelFormatObj pf = NULL;
-    GLint npf = 0;
-    CGLError e = CGLChoosePixelFormat(attrs, &pf, &npf);
-    if (e != kCGLNoError || !pf) { *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT; return NULL; }
-
-    CGLContextObj ctx = NULL;
-    e = CGLCreateContext(pf, NULL, &ctx);
-    CGLReleasePixelFormat(pf);
-    if (e != kCGLNoError || !ctx) { *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT; return NULL; }
-
-    /* Create a pbuffer for offscreen rendering */
-    GLint w = cfg->width  > 0 ? cfg->width  : 640;
-    GLint h = cfg->height > 0 ? cfg->height : 480;
-    CGLPBufferObj pb = NULL;
-    e = CGLCreatePBuffer(w, h, GL_TEXTURE_2D, GL_RGBA, 0, &pb);
-    if (e != kCGLNoError || !pb) {
-        CGLDestroyContext(ctx);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
-    }
-
-    e = CGLSetPBuffer(ctx, pb, 0, 0, 0);
-    if (e != kCGLNoError) {
-        CGLDestroyPBuffer(pb);
-        CGLDestroyContext(ctx);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
-    }
-
-    fossil_cube_window_t* win = (fossil_cube_window_t*)calloc(1, sizeof(*win));
-    win->width = w;
-    win->height = h;
-    win->double_buffer = cfg->double_buffer ? 1 : 0; /* mostly irrelevant offscreen */
-    win->headless = 1;
-    win->cgl_ctx = ctx;
-    win->cgl_pbuffer = pb;
-
-    if (CGLSetCurrentContext(ctx) != kCGLNoError) {
-        fossil_cube_destroy(win);
-        *out_err = FOSSIL_CUBE_ERR_MAKE_CURRENT;
-        return NULL;
-    }
-
-    *out_err = FOSSIL_CUBE_OK;
-    return win;
-}
-
-static void cube_destroy_platform(fossil_cube_window_t* win) {
-    if (!win) return;
-    if (win->cgl_ctx) {
-        CGLSetCurrentContext(NULL);
-        CGLDestroyContext((CGLContextObj)win->cgl_ctx);
-    }
-    if (win->cgl_pbuffer) {
-        CGLDestroyPBuffer((CGLPBufferObj)win->cgl_pbuffer);
-    }
-    free(win);
-}
-
-static fossil_cube_result_t cube_make_current_platform(fossil_cube_window_t* win) {
-    return (CGLSetCurrentContext((CGLContextObj)win->cgl_ctx) == kCGLNoError) ?
-           FOSSIL_CUBE_OK : FOSSIL_CUBE_ERR_MAKE_CURRENT;
-}
-
-static void cube_swap_buffers_platform(fossil_cube_window_t* win) {
-    (void)win; /* Offscreen; nothing to swap. */
-}
-
-static void cube_poll_events_platform(fossil_cube_window_t* win, fossil_cube_events_t* out_events) {
-    (void)win;
-    (void)out_events;
-    /* Headless: no events. */
-}
-
-static void cube_set_vsync_platform(fossil_cube_window_t* win, int interval) {
-    (void)win; (void)interval; /* Offscreen; ignored. */
-}
-
-static void* cube_get_proc_address_platform(const char* name) {
-    /* CGL doesn’t have a general GetProc; core GL 2.1 is available. Return NULL for extensions. */
-    (void)name;
-    return NULL;
-}
-
-/* --------------------------------------------------------------
- * Linux/*BSD (X11 + GLX)
- * -------------------------------------------------------------- */
-#else
-
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
-#include <X11/Xatom.h>
-#include <GL/glx.h>
-
-typedef int (*PFNGLXSWAPINTERVALEXTPROC)(Display*, GLXDrawable, int);
-typedef int (*PFNGLXSWAPINTERVALSGIPROC)(int);
-static PFNGLXSWAPINTERVALEXTPROC p_glXSwapIntervalEXT = NULL;
-static PFNGLXSWAPINTERVALSGIPROC p_glXSwapIntervalSGI = NULL;
-
-static void cube_glx_try_load_swapinterval(Display* dpy) {
-    if (!p_glXSwapIntervalEXT) {
-        p_glXSwapIntervalEXT = (PFNGLXSWAPINTERVALEXTPROC)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalEXT");
-    }
-    if (!p_glXSwapIntervalSGI) {
-        p_glXSwapIntervalSGI = (PFNGLXSWAPINTERVALSGIPROC)glXGetProcAddressARB((const GLubyte*)"glXSwapIntervalSGI");
-    }
-    (void)dpy;
-}
-
-static fossil_cube_window_t* cube_create_platform(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err) {
-    *out_err = FOSSIL_CUBE_ERR_GENERIC;
-
+static int cube_x11_create(const fossil_cube_config* cfg, fossil_cube_t** out) {
     Display* dpy = XOpenDisplay(NULL);
-    if (!dpy) { *out_err = FOSSIL_CUBE_ERR_NO_DISPLAY; return NULL; }
+    if (!dpy) return FOSSIL_CUBE_ERR_PLATFORM;
 
     int screen = DefaultScreen(dpy);
 
-    int att[] = {
-        GLX_RGBA,
-        GLX_DOUBLEBUFFER,
-        GLX_RED_SIZE,    8,
-        GLX_GREEN_SIZE,  8,
-        GLX_BLUE_SIZE,   8,
-        GLX_DEPTH_SIZE,  cfg->depth_bits ? cfg->depth_bits : 24,
-        GLX_STENCIL_SIZE,cfg->stencil_bits ? cfg->stencil_bits : 8,
+    static int attr[] = {
+        GLX_RGBA, GLX_DOUBLEBUFFER,
+        GLX_RED_SIZE,   8,
+        GLX_GREEN_SIZE, 8,
+        GLX_BLUE_SIZE,  8,
+        GLX_DEPTH_SIZE, 24,
+        GLX_STENCIL_SIZE, 8,
         None
     };
 
-    XVisualInfo* vi = glXChooseVisual(dpy, screen, att);
-    if (!vi) {
-        XCloseDisplay(dpy);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
-    }
+    XVisualInfo* vi = glXChooseVisual(dpy, screen, attr);
+    if (!vi) { XCloseDisplay(dpy); return FOSSIL_CUBE_ERR_PLATFORM; }
 
     Colormap cmap = XCreateColormap(dpy, RootWindow(dpy, vi->screen), vi->visual, AllocNone);
     XSetWindowAttributes swa;
-    memset(&swa, 0, sizeof(swa));
     swa.colormap = cmap;
-    swa.event_mask = ExposureMask | StructureNotifyMask | KeyPressMask | KeyReleaseMask;
+    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
+                     ButtonPressMask | ButtonReleaseMask | StructureNotifyMask;
 
-    int w = cfg->width > 0 ? cfg->width : 640;
-    int h = cfg->height > 0 ? cfg->height : 480;
-
-    Window win = XCreateWindow(
-        dpy, RootWindow(dpy, vi->screen),
-        0, 0, (unsigned)w, (unsigned)h, 0,
-        vi->depth, InputOutput, vi->visual,
-        CWColormap | CWEventMask, &swa
-    );
-
-    if (!win) {
-        XFreeColormap(dpy, cmap);
-        XFree(vi);
-        XCloseDisplay(dpy);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_WINDOW;
-        return NULL;
-    }
+    Window win = XCreateWindow(dpy, RootWindow(dpy, vi->screen),
+                               0, 0, (unsigned)cfg->width, (unsigned)cfg->height, 0,
+                               vi->depth, InputOutput, vi->visual,
+                               CWColormap | CWEventMask, &swa);
 
     XStoreName(dpy, win, cfg->title ? cfg->title : "Fossil CUBE");
+
+    /* WM_DELETE_WINDOW protocol */
+    Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(dpy, win, &wm_delete, 1);
+
     XMapWindow(dpy, win);
 
-    GLXContext ctx = glXCreateContext(dpy, vi, 0, True);
-    XFree(vi);
+    /* GLX context */
+    GLXContext ctx = glXCreateContext(dpy, vi, NULL, True);
     if (!ctx) {
         XDestroyWindow(dpy, win);
         XFreeColormap(dpy, cmap);
         XCloseDisplay(dpy);
-        *out_err = FOSSIL_CUBE_ERR_CREATE_CONTEXT;
-        return NULL;
+        return FOSSIL_CUBE_ERR_GL;
     }
+    glXMakeCurrent(dpy, win, ctx);
 
-    if (!glXMakeCurrent(dpy, win, ctx)) {
+    /* Load glXGetProcAddress for GL function loading */
+    glXGetProcAddressARB_ = (PFNGLXGETPROCADDRESSARBPROC)glXGetProcAddressARB((const GLubyte*)"glXGetProcAddressARB");
+
+    /* Load GL procs */
+    cube_load_gl_procs();
+
+    /* Instance */
+    fossil_cube_t* cube = (fossil_cube_t*)calloc(1, sizeof(*cube));
+    if (!cube) {
         glXDestroyContext(dpy, ctx);
         XDestroyWindow(dpy, win);
         XFreeColormap(dpy, cmap);
         XCloseDisplay(dpy);
-        *out_err = FOSSIL_CUBE_ERR_MAKE_CURRENT;
-        return NULL;
+        return FOSSIL_CUBE_ERR_ALLOC;
     }
 
-    fossil_cube_window_t* cw = (fossil_cube_window_t*)calloc(1, sizeof(*cw));
-    cw->dpy = dpy;
-    cw->win = win;
-    cw->ctx = ctx;
-    cw->cmap = cmap;
-    cw->width = w;
-    cw->height = h;
-    cw->double_buffer = 1;
-    cw->headless = 0;
+    cube->dpy = dpy;
+    cube->screen = screen;
+    cube->win = win;
+    cube->ctx = ctx;
+    cube->wm_delete = wm_delete;
 
-    cw->wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
-    XSetWMProtocols(dpy, win, &cw->wm_delete, 1);
+    /* Initial size */
+    cube->width = cfg->width;
+    cube->height = cfg->height;
 
-    cube_glx_try_load_swapinterval(dpy);
-    if (cfg->vsync) {
-        if (p_glXSwapIntervalEXT) {
-            p_glXSwapIntervalEXT(dpy, glXGetCurrentDrawable(), 1);
-        } else if (p_glXSwapIntervalSGI) {
-            p_glXSwapIntervalSGI(1);
-        }
+    clock_gettime(CLOCK_MONOTONIC, &cube->start_ts);
+
+    /* V-sync hint (GLX_EXT_swap_control etc. not guaranteed; ignore if unavailable) */
+    (void)cfg; /* we keep cfg->vsync best-effort; left as future improvement */
+
+    *out = cube;
+    return FOSSIL_CUBE_OK;
+}
+
+#endif /* Linux */
+
+/* --- Platform: macOS (attach-only in this pure-C build) --- */
+
+#if defined(__APPLE__)
+int fossil_cube_attach_existing_context(void* ns_window,
+                                        void* ns_view,
+                                        void* ns_glctx,
+                                        fossil_cube_t** out)
+{
+    if (!ns_glctx || !out) return FOSSIL_CUBE_ERR_PARAM;
+
+    fossil_cube_t* cube = (fossil_cube_t*)calloc(1, sizeof(*cube));
+    if (!cube) return FOSSIL_CUBE_ERR_ALLOC;
+
+    cube->ns_window = ns_window;
+    cube->ns_view = ns_view;
+    cube->ns_glctx = ns_glctx;
+    cube->start_time = cube_now_seconds_posix();
+
+    /* GL procs are provided by system lib; just try to fetch pointers. */
+    cube_load_gl_procs();
+
+    /* We cannot know size without querying Cocoa; default to 800x600. */
+    cube->width = 800;
+    cube->height = 600;
+
+    *out = cube;
+    return FOSSIL_CUBE_OK;
+}
+#else
+int fossil_cube_attach_existing_context(void* a, void* b, void* c, fossil_cube_t** out) {
+    (void)a; (void)b; (void)c; (void)out;
+    return FOSSIL_CUBE_ERR_PLATFORM;
+}
+#endif
+
+/* --- Public API: create/destroy --- */
+int fossil_cube_create(const fossil_cube_config* cfg, fossil_cube_t** out) {
+    if (!cfg || !out || cfg->width <= 0 || cfg->height <= 0) return FOSSIL_CUBE_ERR_PARAM;
+
+#if defined(_WIN32) || defined(_WIN64)
+    return cube_win_create(cfg, out);
+#elif defined(__APPLE__)
+    (void)cfg; (void)out;
+    /* On macOS, pure-C window creation would require Obj-C runtime. Use attach API. */
+    return FOSSIL_CUBE_ERR_PLATFORM;
+#else
+    return cube_x11_create(cfg, out);
+#endif
+}
+
+void fossil_cube_destroy(fossil_cube_t* cube) {
+    if (!cube) return;
+
+#if defined(_WIN32) || defined(_WIN64)
+    wglMakeCurrent(NULL, NULL);
+    if (cube->hglrc) wglDeleteContext(cube->hglrc);
+    if (cube->hwnd && cube->hdc) ReleaseDC(cube->hwnd, cube->hdc);
+    if (cube->hwnd) DestroyWindow(cube->hwnd);
+#elif defined(__APPLE__)
+    /* Context and window are owned by the host app when attached; do nothing. */
+    (void)cube;
+#else
+    if (cube->dpy) {
+        glXMakeCurrent(cube->dpy, None, NULL);
+        if (cube->ctx) glXDestroyContext(cube->dpy, cube->ctx);
+        if (cube->win) XDestroyWindow(cube->dpy, cube->win);
+        XCloseDisplay(cube->dpy);
     }
-
-    *out_err = FOSSIL_CUBE_OK;
-    return cw;
+#endif
+    free(cube);
 }
 
-static void cube_destroy_platform(fossil_cube_window_t* win) {
-    if (!win) return;
-    if (win->dpy) {
-        glXMakeCurrent(win->dpy, None, NULL);
-        if (win->ctx) glXDestroyContext(win->dpy, win->ctx);
-        if (win->win) XDestroyWindow(win->dpy, win->win);
-        if (win->cmap) XFreeColormap(win->dpy, win->cmap);
-        XCloseDisplay(win->dpy);
+/* --- Events / swap / size --- */
+void fossil_cube_poll_events(fossil_cube_t* cube) {
+    if (!cube) return;
+
+#if defined(_WIN32) || defined(_WIN64)
+    MSG msg;
+    while (PeekMessageA(&msg, cube->hwnd, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
     }
-    free(win);
-}
-
-static fossil_cube_result_t cube_make_current_platform(fossil_cube_window_t* win) {
-    return glXMakeCurrent(win->dpy, win->win, win->ctx) ? FOSSIL_CUBE_OK : FOSSIL_CUBE_ERR_MAKE_CURRENT;
-}
-
-static void cube_swap_buffers_platform(fossil_cube_window_t* win) {
-    if (win->dpy && win->win) glXSwapBuffers(win->dpy, win->win);
-}
-
-static void cube_poll_events_platform(fossil_cube_window_t* win, fossil_cube_events_t* out_events) {
-    while (XPending(win->dpy)) {
+#elif defined(__APPLE__)
+    /* Host app should pump NSApp events; nothing to do in pure C here. */
+    (void)cube;
+#else
+    while (XPending(cube->dpy)) {
         XEvent e;
-        XNextEvent(win->dpy, &e);
+        XNextEvent(cube->dpy, &e);
         switch (e.type) {
             case ClientMessage:
-                if ((Atom)e.xclient.data.l[0] == win->wm_delete) {
-                    out_events->should_close = 1;
-                }
+                if ((Atom)e.xclient.data.l[0] == cube->wm_delete)
+                    cube->should_close = 1;
                 break;
-            case ConfigureNotify: {
-                int nw = e.xconfigure.width;
-                int nh = e.xconfigure.height;
-                if (nw != win->width || nh != win->height) {
-                    win->width = nw; win->height = nh;
-                    out_events->resized = 1;
-                    out_events->width = nw;
-                    out_events->height = nh;
-                }
+            case ConfigureNotify:
+                cube->width = e.xconfigure.width;
+                cube->height = e.xconfigure.height;
                 break;
-            }
-            default:
-                break;
+            default: break;
         }
     }
+#endif
 }
 
-static void cube_set_vsync_platform(fossil_cube_window_t* win, int interval) {
-    (void)win;
-    if (p_glXSwapIntervalEXT) {
-        p_glXSwapIntervalEXT(glXGetCurrentDisplay(), glXGetCurrentDrawable(), interval ? 1 : 0);
-    } else if (p_glXSwapIntervalSGI) {
-        p_glXSwapIntervalSGI(interval ? 1 : 0);
+void fossil_cube_swap_buffers(fossil_cube_t* cube) {
+    if (!cube) return;
+#if defined(_WIN32) || defined(_WIN64)
+    SwapBuffers(cube->hdc);
+#elif defined(__APPLE__)
+    /* Host should call -[NSOpenGLContext flushBuffer] */
+    (void)cube;
+#else
+    glXSwapBuffers(cube->dpy, cube->win);
+#endif
+}
+
+int fossil_cube_should_close(const fossil_cube_t* cube) {
+    return cube ? cube->should_close : 1;
+}
+
+void fossil_cube_set_should_close(fossil_cube_t* cube, int should_close) {
+    if (cube) cube->should_close = should_close ? 1 : 0;
+}
+
+void fossil_cube_get_size(const fossil_cube_t* cube, int* w, int* h) {
+    if (!cube) return;
+    if (w) *w = cube->width;
+    if (h) *h = cube->height;
+}
+
+double fossil_cube_get_time(void) {
+#if defined(_WIN32) || defined(_WIN64)
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    return cube_now_seconds_win(freq);
+#elif defined(__APPLE__)
+    return cube_now_seconds_posix();
+#else
+    return cube_now_seconds_posix();
+#endif
+}
+
+void* fossil_cube_get_proc(fossil_cube_t* cube, const char* name) {
+    (void)cube;
+    if (!name) return NULL;
+#if defined(_WIN32) || defined(_WIN64)
+    void* p = (void*)wglGetProcAddress(name);
+    if (!p) p = (void*)GetProcAddress(GetModuleHandleA("opengl32.dll"), name);
+    return p;
+#elif defined(__APPLE__)
+    return dlsym(RTLD_DEFAULT, name);
+#else
+    if (!glXGetProcAddressARB_) glXGetProcAddressARB_ =
+        (PFNGLXGETPROCADDRESSARBPROC)glXGetProcAddressARB((const GLubyte*)"glXGetProcAddressARB");
+    return glXGetProcAddressARB_ ? glXGetProcAddressARB_((const GLubyte*)name) : NULL;
+#endif
+}
+
+/* --- Modern-GL helper implementations --- */
+GLuint fossil_cube_compile_shader(GLenum type, const char* src, char* log_out, size_t* log_len) {
+    if (!src) return 0;
+    if (!glCreateShader || !glShaderSource || !glCompileShader) return 0;
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+
+    if (log_out && log_len && *log_len) {
+        GLsizei got = 0;
+        glGetShaderInfoLog(sh, (GLsizei)(*log_len), &got, log_out);
+        /* ensure NUL termination */
+        if ((size_t)got >= *log_len) log_out[*log_len - 1] = '\0';
+    }
+    if (!ok) { glDeleteShader(sh); return 0; }
+    return sh;
+}
+
+GLuint fossil_cube_link_program(GLuint vs, GLuint fs, char* log_out, size_t* log_len) {
+    if (!glCreateProgram || !glAttachShader || !glLinkProgram) return 0;
+    GLuint prog = glCreateProgram();
+    if (vs) glAttachShader(prog, vs);
+    if (fs) glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+
+    if (log_out && log_len && *log_len) {
+        GLsizei got = 0;
+        glGetProgramInfoLog(prog, (GLsizei)(*log_len), &got, log_out);
+        if ((size_t)got >= *log_len) log_out[*log_len - 1] = '\0';
+    }
+    if (!ok) { glDeleteProgram(prog); return 0; }
+    return prog;
+}
+
+int fossil_cube_create_vao_vbo(GLuint* vao_out, GLuint* vbo_out, const void* data, size_t bytes) {
+    if (!glGenBuffers || !glBindBuffer || !glBufferData) return 0;
+
+    GLuint vbo = 0, vao = 0;
+    glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (ptrdiff_t)bytes, data, GL_STATIC_DRAW);
+
+    if (glGenVertexArrays && glBindVertexArray) {
+        glGenVertexArrays(1, &vao);
+        glBindVertexArray(vao);
+    }
+
+    if (vbo_out) *vbo_out = vbo;
+    if (vao_out) *vao_out = vao; /* may be 0 if VAO unsupported */
+    return 1;
+}
+
+void fossil_cube_destroy_vao_vbo(GLuint vao, GLuint vbo) {
+    if (glBindVertexArray && vao) {
+        glBindVertexArray(0);
+        glDeleteVertexArrays(1, &vao);
+    }
+    if (vbo) {
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glDeleteBuffers(1, &vbo);
     }
 }
 
-static void* cube_get_proc_address_platform(const char* name) {
-    return (void*)glXGetProcAddressARB((const GLubyte*)name);
+void fossil_cube_set_vsync(fossil_cube_t* cube, int vsync) {
+    if (!cube) return;
+    cube->vsync = vsync ? 1 : 0;
+#if defined(_WIN32) || defined(_WIN64)
+    if (wglSwapIntervalEXT_) wglSwapIntervalEXT_(cube->vsync);
+#else
+    (void)vsync; /* Best-effort on other platforms; extension-specific. */
+#endif
 }
 
-#endif /* Platforms */
+void fossil_cube_set_viewport(int x, int y, int w, int h) {
+    glViewport(x, y, w, h);
+}
+
+void fossil_cube_set_clear_color(float r, float g, float b, float a) {
+    glClearColor(r, g, b, a);
+}
+
+void fossil_cube_clear(GLbitfield mask) {
+    glClear(mask);
+}
+
+void fossil_cube_get_native(const fossil_cube_t* cube, fossil_cube_native* out) {
+    if (!cube || !out) return;
+    memset(out, 0, sizeof(*out));
+#if defined(_WIN32) || defined(_WIN64)
+    out->hInstance = (void*)cube->hinst;
+    out->hwnd = (void*)cube->hwnd;
+    out->hdc = (void*)cube->hdc;
+    out->hglrc = (void*)cube->hglrc;
+#elif defined(__APPLE__)
+    out->ns_window = cube->ns_window;
+    out->ns_view   = cube->ns_view;
+    out->ns_glctx  = cube->ns_glctx;
+#else
+    out->display = (void*)cube->dpy;
+    out->window  = (uintptr_t)cube->win;
+    out->glx_ctx = (void*)cube->ctx;
+#endif
+}
