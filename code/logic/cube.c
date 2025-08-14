@@ -30,6 +30,8 @@
     static PFNGLXGETPROCADDRESSPROC s_glXGetProcAddress = NULL;
 #endif
 
+#include <stdarg.h>
+
 /* -------- Internal state -------- */
 typedef struct fossil_cube_state {
     fossil_cube_caps caps;
