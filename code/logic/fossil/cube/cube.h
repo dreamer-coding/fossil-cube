@@ -50,86 +50,103 @@
 extern "C" {
 #endif
 
-/* Version */
-#define FOSSIL_CUBE_VERSION_MAJOR 0
-#define FOSSIL_CUBE_VERSION_MINOR 1
-#define FOSSIL_CUBE_VERSION_PATCH 0
+/* Forward decl */
+typedef struct fossil_cube_t fossil_cube_t;
 
-/* Public result codes */
-typedef enum fossil_cube_result_e {
+/* Basic configuration for a windowed GL context. */
+typedef struct fossil_cube_config {
+    int width;            /* client area width */
+    int height;           /* client area height */
+    const char* title;    /* window title (UTF-8) */
+    int gl_major;         /* requested GL major version (hint) */
+    int gl_minor;         /* requested GL minor version (hint) */
+    int vsync;            /* 0 = off, 1 = on if possible */
+    int resizable;        /* 0 or 1 (ignored on some platforms) */
+} fossil_cube_config;
+
+/* Opaque platform-native handles if you need them (optional). */
+typedef struct fossil_cube_native {
+#if defined(_WIN32) || defined(_WIN64)
+    void* hInstance;      /* HINSTANCE */
+    void* hwnd;           /* HWND */
+    void* hdc;            /* HDC */
+    void* hglrc;          /* HGLRC */
+#elif defined(__APPLE__)
+    void* ns_window;      /* NSWindow* (if available) */
+    void* ns_view;        /* NSView*   (if available) */
+    void* ns_glctx;       /* NSOpenGLContext* */
+#else
+    void* display;        /* Display* */
+    uintptr_t window;     /* Window (XID) */
+    void* glx_ctx;        /* GLXContext */
+#endif
+} fossil_cube_native;
+
+/* Error codes (return 0 = success; negative = failure). */
+enum {
     FOSSIL_CUBE_OK = 0,
-    FOSSIL_CUBE_ERR_GENERIC = -1,
-    FOSSIL_CUBE_ERR_PLATFORM = -2,
-    FOSSIL_CUBE_ERR_NO_DISPLAY = -3,
-    FOSSIL_CUBE_ERR_CREATE_WINDOW = -4,
-    FOSSIL_CUBE_ERR_CREATE_CONTEXT = -5,
-    FOSSIL_CUBE_ERR_MAKE_CURRENT = -6,
-    FOSSIL_CUBE_ERR_GL_LOADER = -7,
-    FOSSIL_CUBE_ERR_HEADLESS_ONLY = -8,
-} fossil_cube_result_t;
+    FOSSIL_CUBE_ERR_PLATFORM = -1,
+    FOSSIL_CUBE_ERR_GL       = -2,
+    FOSSIL_CUBE_ERR_ALLOC    = -3,
+    FOSSIL_CUBE_ERR_PARAM    = -4
+};
 
-/* Opaque handle for a GL context + (optionally) a native window */
-typedef struct fossil_cube_window_t fossil_cube_window_t;
+/* Creation / destruction */
+int  fossil_cube_create(const fossil_cube_config* cfg, fossil_cube_t** out);
+void fossil_cube_destroy(fossil_cube_t* cube);
 
-/* Basic configuration for window/context creation */
-typedef struct fossil_cube_config_t {
-    int width;               /* Desired width  (ignored for macOS headless; used as pbuffer size) */
-    int height;              /* Desired height (ignored for macOS headless; used as pbuffer size) */
-    int color_bits;          /* Usually 24 or 32 */
-    int depth_bits;          /* Usually 24 */
-    int stencil_bits;        /* Usually 8  */
-    int double_buffer;       /* 1 = double buffer, 0 = single */
-    int vsync;               /* 1 = request vsync, 0 = no vsync (best-effort) */
-    const char* title;       /* Window title (ignored for macOS headless) */
-} fossil_cube_config_t;
+/* macOS helper: attach an already-created NSOpenGLContext (pure C build friendly).
+ * Pass your NSWindow/NSView/NSOpenGLContext* as void* (may pass NULL for window/view).
+ */
+int  fossil_cube_attach_existing_context(void* ns_window,
+                                         void* ns_view,
+                                         void* ns_opengl_context,
+                                         fossil_cube_t** out);
 
-/* Simple event mask (future-proof). For now we only track close + resize. */
-typedef struct fossil_cube_events_t {
-    int should_close;        /* Set when the user requests close (Win/X11). */
-    int resized;             /* Set when the surface resized (Win/X11).     */
-    int width;               /* New width  if resized != 0                  */
-    int height;              /* New height if resized != 0                  */
-} fossil_cube_events_t;
+/* Main loop utilities */
+void fossil_cube_poll_events(fossil_cube_t* cube);
+void fossil_cube_swap_buffers(fossil_cube_t* cube);
+int  fossil_cube_should_close(const fossil_cube_t* cube);
+void fossil_cube_set_should_close(fossil_cube_t* cube, int should_close);
+void fossil_cube_get_size(const fossil_cube_t* cube, int* w, int* h);
+double fossil_cube_get_time(void); /* monotonic seconds since library init */
 
-/* ---- API ---- */
+/* Raw GL function address (for loading extensions manually if desired). */
+void* fossil_cube_get_proc(fossil_cube_t* cube, const char* name);
 
-/* Initialize internal state (optional on most platforms, idempotent). */
-fossil_cube_result_t fossil_cube_init(void);
+/* Minimal modern-GL helper set (no deprecated pipeline). Great for quick bring-up. */
 
-/* Terminate/cleanup any global state. Safe to call multiple times. */
-void fossil_cube_shutdown(void);
+/* Compile a shader (GL_VERTEX_SHADER or GL_FRAGMENT_SHADER). Returns shader id or 0 on error.
+ * If log_out != NULL and *log_len != 0, writes infolog (NUL-terminated) up to *log_len bytes.
+ * On return, *log_len contains written length (including NUL).
+ */
+GLuint fossil_cube_compile_shader(GLenum type,
+                                  const char* source,
+                                  char* log_out,
+                                  size_t* log_len);
 
-/* Create a window + GL context (windowed on Win/X11, headless pbuffer on macOS). */
-fossil_cube_window_t* fossil_cube_create(const fossil_cube_config_t* cfg, fossil_cube_result_t* out_err);
+/* Link a program from the given shader objects (which you can glDeleteShader after).
+ * Returns program id or 0 on error; optional info log like compile helper.
+ */
+GLuint fossil_cube_link_program(GLuint vs, GLuint fs, char* log_out, size_t* log_len);
 
-/* Destroy a window/context. */
-void fossil_cube_destroy(fossil_cube_window_t* win);
+/* Create a VAO (if available) and a VBO, upload data (GL_STATIC_DRAW).
+ * Returns 1 on success; vao_out may be 0 if VAO not supported (then just bind VBO and set attribs).
+ */
+int fossil_cube_create_vao_vbo(GLuint* vao_out, GLuint* vbo_out,
+                               const void* data, size_t bytes);
 
-/* Make the context current on the calling thread. */
-fossil_cube_result_t fossil_cube_make_current(fossil_cube_window_t* win);
+/* Destroy VAO/VBO (safe to pass 0). */
+void fossil_cube_destroy_vao_vbo(GLuint vao, GLuint vbo);
 
-/* Swap buffers if double-buffered; no-op for single-buffer or headless. */
-void fossil_cube_swap_buffers(fossil_cube_window_t* win);
+/* Convenience GL helpers (thin wrappers). */
+void fossil_cube_set_vsync(fossil_cube_t* cube, int vsync);
+void fossil_cube_set_viewport(int x, int y, int w, int h);
+void fossil_cube_set_clear_color(float r, float g, float b, float a);
+void fossil_cube_clear(GLbitfield mask);
 
-/* Poll native events; fills out simple event struct. Non-blocking. */
-void fossil_cube_poll_events(fossil_cube_window_t* win, fossil_cube_events_t* out_events);
-
-/* Set swap interval (vsync): 0 = off, 1 = on (best-effort). */
-void fossil_cube_set_vsync(fossil_cube_window_t* win, int interval);
-
-/* Get native GL procedure address for extension loading. */
-void* fossil_cube_get_proc_address(const char* name);
-
-/* Accessors */
-int  fossil_cube_width(const fossil_cube_window_t* win);
-int  fossil_cube_height(const fossil_cube_window_t* win);
-int  fossil_cube_is_headless(const fossil_cube_window_t* win); /* 1 if offscreen (macOS), 0 otherwise */
-
-/* Utility: human-readable error string (static text). */
-const char* fossil_cube_strerror(fossil_cube_result_t err);
-
-/* Minimal spin helper: returns 0 if a close was requested. */
-int fossil_cube_frame(fossil_cube_window_t* win, fossil_cube_events_t* ev); /* poll events + swap if double-buffered */
+/* query native handles (for advanced users). */
+void fossil_cube_get_native(const fossil_cube_t* cube, fossil_cube_native* out);
 
 #ifdef __cplusplus
 }
