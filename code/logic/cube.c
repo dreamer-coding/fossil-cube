@@ -137,23 +137,59 @@ void fossil_cube_present(fossil_cube_t *cube) {
 }
 
 bool fossil_cube_poll_event(fossil_cube_t *cube, int *event_type, int *p1, int *p2) {
+    if (!cube) return false;
+    cube_platform_t *plat = cube->platform;
+
 #if defined(_WIN32)
     MSG msg;
     if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
+
+        // Map some basic events
+        if (event_type) *event_type = msg.message;
+        if (p1) *p1 = (int)msg.wParam;
+        if (p2) *p2 = (int)msg.lParam;
+
         return true;
     }
+
 #elif defined(__APPLE__)
     // macOS event handling omitted
 #else
-    cube_platform_t *plat = cube->platform;
-    while (XPending(plat->dpy)) {
+    if (XPending(plat->dpy)) {
         XEvent e;
         XNextEvent(plat->dpy, &e);
-        *event_type = e.type;
+
+        if (event_type) *event_type = e.type;
+
+        switch (e.type) {
+            case KeyPress:
+            case KeyRelease:
+                if (p1) *p1 = e.xkey.keycode;   // keycode
+                if (p2) *p2 = e.xkey.state;     // modifier mask
+                break;
+            case ButtonPress:
+            case ButtonRelease:
+                if (p1) *p1 = e.xbutton.button; // mouse button
+                if (p2) *p2 = e.xbutton.state;  // modifier mask
+                break;
+            case MotionNotify:
+                if (p1) *p1 = e.xmotion.x;
+                if (p2) *p2 = e.xmotion.y;
+                break;
+            default:
+                if (p1) *p1 = 0;
+                if (p2) *p2 = 0;
+                break;
+        }
         return true;
     }
 #endif
+
+    // No event
+    if (event_type) *event_type = 0;
+    if (p1) *p1 = 0;
+    if (p2) *p2 = 0;
     return false;
 }
